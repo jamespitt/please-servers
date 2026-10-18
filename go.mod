@@ -1,6 +1,6 @@
 module github.com/thought-machine/please-servers
 
-go 1.26
+go 1.27.1
 
 ignore plz-out
 

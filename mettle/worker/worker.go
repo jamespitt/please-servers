@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +22,7 @@ import (
 	psraw "cloud.google.com/go/pubsub/apiv1"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/client"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/command"
+	"github.com/bazelbuild/remote-apis-sdks/go/pkg/digest"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/filemetadata"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/uploadinfo"
 	pb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
@@ -1192,11 +1194,52 @@ func (w *worker) collectOutputs(ar *pb.ActionResult, cmd *pb.Command) error {
 	}
 	err = w.client.UploadIfMissing(entries, compressors)
 
+	setRootDirectoryDigests(ar2.OutputDirectories, m)
 	ar.OutputFiles = ar2.OutputFiles
 	ar.OutputDirectories = ar2.OutputDirectories
 	ar.OutputFileSymlinks = ar2.OutputFileSymlinks
 	ar.OutputDirectorySymlinks = ar2.OutputDirectorySymlinks
+	ar.OutputSymlinks = allOutputSymlinks(ar2)
 	return err
+}
+
+// setRootDirectoryDigests populates root_directory_digest on each output directory (REAPI 2.8), which
+// lets clients use an output directory without fetching its whole Tree.
+// ComputeOutputsToUpload already uploads every Directory individually as well as the Tree, so we
+// only need to find the root's digest. We use the root as it appears in the Tree, which includes the
+// pack property if there is one.
+// This is best-effort: if we can't work it out we leave it unset, and clients can still use the Tree.
+func setRootDirectoryDigests(dirs []*pb.OutputDirectory, entries map[digest.Digest]*uploadinfo.Entry) {
+	for _, dir := range dirs {
+		entry, present := entries[digest.NewFromProtoUnvalidated(dir.TreeDigest)]
+		if !present || !entry.IsBlob() {
+			log.Warning("Can't find Tree for output directory %s, not setting its root directory digest", dir.Path)
+			continue
+		}
+		tree := &pb.Tree{}
+		if err := proto.Unmarshal(entry.Contents, tree); err != nil {
+			log.Warning("Failed to decode Tree for output directory %s: %s", dir.Path, err)
+			continue
+		}
+		rootDigest, err := digest.NewFromMessage(tree.Root)
+		if err != nil {
+			log.Warning("Failed to calculate root directory digest for output directory %s: %s", dir.Path, err)
+			continue
+		} else if _, present := entries[rootDigest]; !present {
+			log.Warning("Root directory for output directory %s is not being uploaded, not setting its digest", dir.Path)
+			continue
+		}
+		dir.RootDirectoryDigest = rootDigest.ToProto()
+	}
+}
+
+// allOutputSymlinks returns all the output symlinks from an action result, preferring output_symlinks
+// if it's populated and falling back to the deprecated per-type fields otherwise.
+func allOutputSymlinks(ar *pb.ActionResult) []*pb.OutputSymlink {
+	if len(ar.OutputSymlinks) > 0 {
+		return ar.OutputSymlinks
+	}
+	return slices.Concat(ar.OutputFileSymlinks, ar.OutputDirectorySymlinks)
 }
 
 // update sends an update on the response channel

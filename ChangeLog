@@ -1,3 +1,9 @@
+Version 11.18.0
+---------------
+    * Advertise support for REAPI v2.12
+    * Handle newer `output_symlinks` field as well as older, deprecated fields.
+    * Populate `root_directory_digest` on output directories, so clients can use them without fetching the whole Tree.
+
 Version 11.17.0
 ---------------
     * Upgrade Go toolchain, packages and Please plugin
