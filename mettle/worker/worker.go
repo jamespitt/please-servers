@@ -824,6 +824,7 @@ func (w *worker) execute(req *pb.ExecuteRequest, action *pb.Action, command *pb.
 		"hash": w.actionDigest.Hash,
 	}).Info("Uploading outputs")
 	w.observeSysUsage(cmd, execDuration)
+	defer w.logResourceUsage(action, command, ar, cmd, execDuration)
 	if err != nil {
 		log.Debug("Execution failed.\nStdout: %s\nStderr: %s", w.stdout.String(), w.stderr.String())
 		msg := "Execution failed for " + w.actionDigest.Hash + ": " + err.Error()
