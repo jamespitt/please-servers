@@ -1,6 +1,12 @@
+Version 11.19.0
+---------------
+    * Add in ability for multiple pubsub subscriptions for different types of
+    server
+
 Version 11.18.1
 ---------------
     * Internal dependency updates only
+
 
 Version 11.18.0
 ---------------

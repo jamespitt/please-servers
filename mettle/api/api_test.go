@@ -2,9 +2,13 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +17,7 @@ import (
 	"github.com/golang/protobuf/ptypes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/thought-machine/go-flags"
 	bpb "github.com/thought-machine/please-servers/proto/mettle"
 	"gocloud.dev/pubsub"
 	bs "google.golang.org/genproto/googleapis/bytestream"
@@ -392,6 +397,225 @@ func loadJob() map[string]*job {
 	return jobs
 }
 
+// A routingFixture is an API server configured with a standard and a heavy request queue,
+// along with executors consuming from each of them.
+type routingFixture struct {
+	client pb.ExecutionClient
+	std    *executor
+	heavy  *executor
+}
+
+func setupRoutingServer(t *testing.T, allowedPlatform map[string][]string) *routingFixture {
+	casaddr := setupCASServer()
+	stdQueue := fmt.Sprintf("mem://requests-std-%d", queueID)
+	heavyQueue := fmt.Sprintf("mem://requests-heavy-%d", queueID)
+	responses := fmt.Sprintf("mem://responses-routing-%d", queueID)
+	queueID++
+	queues := PubSubOpts{
+		RequestQueue:          stdQueue,
+		ExtraRequestQueues:    map[string]string{"heavy": heavyQueue},
+		ResponseQueue:         responses,
+		PreResponseQueue:      responses,
+		NumPollers:            1,
+		SubscriptionBatchSize: 1,
+	}
+	common.MustOpenTopic(stdQueue)
+	common.MustOpenTopic(heavyQueue)
+	common.MustOpenTopic(responses)
+
+	s, lis, err := serve(grpcutil.Opts{
+		Host: "127.0.0.1",
+		Port: 0,
+	}, "", queues, "", true, allowedPlatform, casaddr, false)
+	require.NoError(t, err)
+	go s.Serve(lis)
+	t.Cleanup(s.Stop)
+
+	conn, err := grpc.Dial(lis.Addr().String(), grpc.WithInsecure())
+	require.NoError(t, err)
+	return &routingFixture{
+		client: pb.NewExecutionClient(conn),
+		std:    newExecutor(stdQueue, responses),
+		heavy:  newExecutor(heavyQueue, responses),
+	}
+}
+
+// execute sends an ExecuteRequest for the given action digest and waits for it to be queued.
+func (f *routingFixture) execute(t *testing.T, d *pb.Digest) {
+	stream, err := f.client.Execute(context.Background(), &pb.ExecuteRequest{ActionDigest: d})
+	require.NoError(t, err)
+	receiveUpdate(t, stream, d.Hash, pb.ExecutionStage_CACHE_CHECK)
+	receiveUpdate(t, stream, d.Hash, pb.ExecutionStage_QUEUED)
+}
+
+// receiveWithin returns the digest of the next request on the executor's queue, failing the test
+// if nothing arrives (as opposed to blocking forever when a request is misrouted).
+func receiveWithin(t *testing.T, ex *executor, queue string) *pb.Digest {
+	ch := make(chan *pb.Digest, 1)
+	go func() { ch <- ex.Receive() }()
+	select {
+	case d := <-ch:
+		return d
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for a request on the "+queue+" queue")
+		return nil
+	}
+}
+
+// registerAction stores an action with the given platform properties in the fake CAS and returns its digest.
+func registerAction(t *testing.T, properties ...*pb.Platform_Property) *pb.Digest {
+	action := &pb.Action{}
+	if len(properties) > 0 {
+		action.Platform = &pb.Platform{Properties: properties}
+	}
+	b, err := proto.Marshal(action)
+	require.NoError(t, err)
+	h := sha256.Sum256(b)
+	d := &pb.Digest{Hash: hex.EncodeToString(h[:]), SizeBytes: int64(len(b))}
+	setCASBlob(d.Hash, b)
+	return d
+}
+
+func TestExecuteHeavyRouting(t *testing.T) {
+	f := setupRoutingServer(t, map[string][]string{})
+	heavy := registerAction(t, &pb.Platform_Property{Name: "worker-type", Value: "heavy"})
+	std := registerAction(t, &pb.Platform_Property{Name: "worker-type", Value: "standard"})
+
+	f.execute(t, heavy)
+	assert.Equal(t, heavy.Hash, receiveWithin(t, f.heavy, "heavy").Hash)
+
+	f.execute(t, std)
+	assert.Equal(t, std.Hash, receiveWithin(t, f.std, "standard").Hash)
+}
+
+// TestExecuteRoutingWithPlatformValidation checks that worker-type is permitted for the configured queues
+// without having to be listed in the allowed platform, while other properties are still validated.
+func TestExecuteRoutingWithPlatformValidation(t *testing.T) {
+	f := setupRoutingServer(t, map[string][]string{"OSFamily": {"linux"}})
+	heavy := registerAction(t, &pb.Platform_Property{Name: "OSFamily", Value: "linux"}, &pb.Platform_Property{Name: "worker-type", Value: "heavy"})
+	f.execute(t, heavy)
+	assert.Equal(t, heavy.Hash, receiveWithin(t, f.heavy, "heavy").Hash)
+
+	for name, d := range map[string]*pb.Digest{
+		"unconfigured worker-type": registerAction(t, &pb.Platform_Property{Name: "worker-type", Value: "gpu"}),
+		"invalid other property":   registerAction(t, &pb.Platform_Property{Name: "OSFamily", Value: "windows"}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			stream, err := f.client.Execute(context.Background(), &pb.ExecuteRequest{ActionDigest: d})
+			require.NoError(t, err)
+			_, err = stream.Recv()
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		})
+	}
+}
+
+func TestExecuteFailsIfActionCannotBeRead(t *testing.T) {
+	f := setupRoutingServer(t, map[string][]string{})
+	d := &pb.Digest{Hash: strings.Repeat("ab", 32), SizeBytes: 10}
+
+	stream, err := f.client.Execute(context.Background(), &pb.ExecuteRequest{ActionDigest: d})
+	require.NoError(t, err)
+	_, err = stream.Recv()
+	require.Error(t, err)
+}
+
+func TestExecuteRoutingFallsBackToStandard(t *testing.T) {
+	f := setupRoutingServer(t, map[string][]string{})
+
+	for name, d := range map[string]*pb.Digest{
+		"no platform":              registerAction(t),
+		"no worker-type property":  registerAction(t, &pb.Platform_Property{Name: "OSFamily", Value: "linux"}),
+		"unconfigured worker-type": registerAction(t, &pb.Platform_Property{Name: "worker-type", Value: "gpu"}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f.execute(t, d)
+			assert.Equal(t, d.Hash, receiveWithin(t, f.std, "standard").Hash)
+		})
+	}
+}
+
+func TestMergeRequestQueues(t *testing.T) {
+	tests := []struct {
+		name               string
+		requestQueue       string
+		extraRequestQueues map[string]string
+		expected           map[string]string
+		err                string
+	}{
+		{
+			name:         "default queue only",
+			requestQueue: "mem://std",
+			expected:     map[string]string{"standard": "mem://std"},
+		},
+		{
+			name:               "default queue and extra queues",
+			requestQueue:       "mem://std",
+			extraRequestQueues: map[string]string{"heavy": "mem://heavy", "gpu": "mem://gpu"},
+			expected:           map[string]string{"standard": "mem://std", "heavy": "mem://heavy", "gpu": "mem://gpu"},
+		},
+		{
+			name:               "standard queue provided via the map",
+			extraRequestQueues: map[string]string{"standard": "mem://std", "heavy": "mem://heavy"},
+			expected:           map[string]string{"standard": "mem://std", "heavy": "mem://heavy"},
+		},
+		{
+			name: "nothing configured",
+			err:  "must be provided",
+		},
+		{
+			name:               "no standard queue",
+			extraRequestQueues: map[string]string{"heavy": "mem://heavy"},
+			err:                "must be provided",
+		},
+		{
+			name:               "empty name",
+			requestQueue:       "mem://std",
+			extraRequestQueues: map[string]string{"": "mem://heavy"},
+			err:                "invalid request queue",
+		},
+		{
+			name:               "empty url",
+			requestQueue:       "mem://std",
+			extraRequestQueues: map[string]string{"heavy": ""},
+			err:                "invalid request queue",
+		},
+		{
+			name:               "standard queue configured twice",
+			requestQueue:       "mem://std",
+			extraRequestQueues: map[string]string{"standard": "mem://other"},
+			err:                "configured twice",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			urls, err := mergeRequestQueues(tc.requestQueue, tc.extraRequestQueues)
+			if tc.err != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, urls)
+		})
+	}
+}
+
+// TestExtraRequestQueuesFlagParsing checks that the queues can be given as name:url pairs, including urls containing colons.
+func TestExtraRequestQueuesFlagParsing(t *testing.T) {
+	var opts PubSubOpts
+	_, err := flags.NewParser(&opts, flags.None).ParseArgs([]string{
+		"--response_queue=mem://responses",
+		"--pre_response_queue=mem://responses",
+		"--extra_request_queues=heavy:gcppubsub://projects/p/topics/heavy",
+		"--extra_request_queues=gpu:mem://gpu",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{
+		"heavy": "gcppubsub://projects/p/topics/heavy",
+		"gpu":   "mem://gpu",
+	}, opts.ExtraRequestQueues)
+}
+
 func recv(stream pb.Execution_ExecuteClient) (*longrunning.Operation, *pb.ExecuteOperationMetadata) {
 	op, err := stream.Recv()
 	if err != nil {
@@ -469,10 +693,37 @@ func (ex *executor) Finish(digest *pb.Digest) {
 	}
 }
 
+var (
+	casBlobs   = map[string][]byte{}
+	casBlobsMu sync.RWMutex
+)
+
+func setCASBlob(hash string, data []byte) {
+	casBlobsMu.Lock()
+	defer casBlobsMu.Unlock()
+	casBlobs[hash] = data
+}
+
+func getCASBlob(hash string) ([]byte, bool) {
+	casBlobsMu.RLock()
+	defer casBlobsMu.RUnlock()
+	data, ok := casBlobs[hash]
+	return data, ok
+}
+
 // A cas is a fake implementation of the CAS server.
 type cas struct{}
 
 func (c cas) Read(req *bs.ReadRequest, srv bs.ByteStream_ReadServer) error {
+	parts := strings.Split(req.ResourceName, "/")
+	if len(parts) >= 3 {
+		hash := parts[len(parts)-2]
+		if data, ok := getCASBlob(hash); ok {
+			return srv.Send(&bs.ReadResponse{
+				Data: data,
+			})
+		}
+	}
 	return status.Errorf(codes.NotFound, "blob %s not found", req.ResourceName)
 }
 
