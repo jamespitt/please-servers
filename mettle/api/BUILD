@@ -1,6 +1,9 @@
 go_library(
     name = "api",
-    srcs = ["api.go"],
+    srcs = [
+        "api.go",
+        "usage.go",
+    ],
     visibility = ["//mettle/..."],
     deps = [
         "///third_party/go/github.com_bazelbuild_remote-apis-sdks//go/pkg/client",
@@ -19,16 +22,21 @@ go_library(
         "///third_party/go/google.golang.org_grpc//codes",
         "///third_party/go/google.golang.org_grpc//metadata",
         "///third_party/go/google.golang.org_grpc//status",
+        "///third_party/go/google.golang.org_protobuf//types/known/timestamppb",
         "//grpcutil",
         "//mettle/common",
         "//proto/mettle",
         "//rexclient",
+        "//third_party/proto/resourceusage",
     ],
 )
 
 go_test(
     name = "api_test",
-    srcs = ["api_test.go"],
+    srcs = [
+        "api_test.go",
+        "usage_test.go",
+    ],
     deps = [
         ":api",
         "///third_party/go/github.com_bazelbuild_remote-apis//build/bazel/remote/execution/v2",
@@ -42,12 +50,16 @@ go_test(
         "///third_party/go/gocloud.dev//pubsub/driver",
         "///third_party/go/google.golang.org_genproto//googleapis/longrunning",
         "///third_party/go/google.golang.org_genproto_googleapis_bytestream//:bytestream",
+        "///third_party/go/google.golang.org_genproto_googleapis_rpc//status",
         "///third_party/go/google.golang.org_grpc//:grpc",
         "///third_party/go/google.golang.org_grpc//codes",
         "///third_party/go/google.golang.org_grpc//status",
+        "///third_party/go/google.golang.org_protobuf//types/known/anypb",
+        "///third_party/go/google.golang.org_protobuf//types/known/timestamppb",
         "//grpcutil",
         "//mettle/common",
         "//proto/mettle",
         "//rexclient",
+        "//third_party/proto/resourceusage",
     ],
 )
