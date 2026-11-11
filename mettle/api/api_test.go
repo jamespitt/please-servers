@@ -29,6 +29,7 @@ import (
 	"google.golang.org/genproto/googleapis/longrunning"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/thought-machine/please-servers/grpcutil"
@@ -770,6 +771,7 @@ func TestMain(m *testing.M) {
 type fakeStream struct {
 	pb.Execution_ExecuteServer
 	ops []*longrunning.Operation
+	ctx context.Context // Used as the stream's context if set.
 }
 
 func (f *fakeStream) Send(op *longrunning.Operation) error {
@@ -778,7 +780,17 @@ func (f *fakeStream) Send(op *longrunning.Operation) error {
 }
 
 func (f *fakeStream) Context() context.Context {
+	if f.ctx != nil {
+		return f.ctx
+	}
 	return context.Background()
+}
+
+// requestMetadataContext returns a context carrying the given request metadata, as a client would send it.
+func requestMetadataContext(t *testing.T, md *pb.RequestMetadata) context.Context {
+	b, err := proto.Marshal(md)
+	require.NoError(t, err)
+	return metadata.NewIncomingContext(context.Background(), metadata.Pairs("build.bazel.remote.execution.v2.requestmetadata-bin", string(b)))
 }
 
 func newTestServer() *server {
@@ -1092,4 +1104,99 @@ func TestPubSubOptsHelpShowsEnvVars(t *testing.T) {
 	flags.NewParser(&opts, flags.None).WriteHelp(&buf)
 	assert.Contains(t, buf.String(), "[$API_NUM_POLLERS]")
 	assert.Contains(t, buf.String(), "[$API_SUBSCRIPTION]")
+}
+
+// requestersOf returns who requested the given job, or nil if the job doesn't exist or has no requesters.
+func (s *server) requestersOf(hash string) *requesters {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if j, present := s.jobs[hash]; present {
+		return j.requesters
+	}
+	return nil
+}
+
+func TestExecuteRemembersRequesters(t *testing.T) {
+	s, _ := newRecordingServer(t, nil)
+	d := registerAction(t)
+	req := &pb.ExecuteRequest{ActionDigest: d, SkipCacheLookup: true}
+	execute := func(md *pb.RequestMetadata) <-chan error {
+		ch := make(chan error, 1)
+		go func() { ch <- s.Execute(req, &fakeStream{ctx: requestMetadataContext(t, md)}) }()
+		return ch
+	}
+
+	first := execute(&pb.RequestMetadata{ToolInvocationId: "inv1", CorrelatedInvocationsId: "build1", TargetId: "//foo:bar"})
+	require.Eventually(t, func() bool { return s.numStreams(d.Hash) == 1 }, 5*time.Second, 10*time.Millisecond)
+	// A second client asking for the same action shares the execution.
+	second := execute(&pb.RequestMetadata{ToolInvocationId: "inv2", CorrelatedInvocationsId: "build2", TargetId: "//other:target"})
+	require.Eventually(t, func() bool { return s.numStreams(d.Hash) == 2 }, 5*time.Second, 10*time.Millisecond)
+
+	r := s.requestersOf(d.Hash)
+	require.NotNil(t, r)
+	assert.Equal(t, defaultRequestQueue, r.workerType)
+	assert.Equal(t, "//foo:bar", r.first.TargetId, "the first client's metadata is the one that is kept")
+	assert.Equal(t, []string{"inv1", "inv2"}, r.toolInvocationIDs)
+	assert.Equal(t, []string{"build1", "build2"}, r.correlatedInvocationsIDs)
+
+	s.process(progressMessage(d.Hash, pb.ExecutionStage_COMPLETED, time.Now()))
+	assert.NoError(t, waitForResult(t, first))
+	assert.NoError(t, waitForResult(t, second))
+}
+
+func TestExecuteRemembersEffectiveWorkerType(t *testing.T) {
+	s, l := newRecordingServer(t, nil)
+	s.requests["heavy"] = pubsub.NewTopic(&recordingTopic{name: "heavy-request", log: l}, nil)
+	for workerType, expected := range map[string]string{
+		"":      defaultRequestQueue,
+		"heavy": "heavy",
+		"gpu":   defaultRequestQueue, // There is no queue for this, so it falls back to the standard one.
+	} {
+		t.Run(workerType, func(t *testing.T) {
+			d := registerAction(t, &pb.Platform_Property{Name: workerTypeProperty, Value: workerType})
+			go func() { s.Execute(&pb.ExecuteRequest{ActionDigest: d, SkipCacheLookup: true}, &fakeStream{}) }()
+			require.Eventually(t, func() bool { return s.requestersOf(d.Hash) != nil }, 5*time.Second, 10*time.Millisecond)
+			assert.Equal(t, expected, s.requestersOf(d.Hash).workerType)
+			s.process(progressMessage(d.Hash, pb.ExecutionStage_COMPLETED, time.Now()))
+		})
+	}
+}
+
+func TestExecuteWithoutRequestMetadata(t *testing.T) {
+	s, _ := newRecordingServer(t, nil)
+	d := registerAction(t)
+	done := goExecute(s, &pb.ExecuteRequest{ActionDigest: d, SkipCacheLookup: true})
+	require.Eventually(t, func() bool { return s.requestersOf(d.Hash) != nil }, 5*time.Second, 10*time.Millisecond)
+	assert.Nil(t, s.requestersOf(d.Hash).first)
+	assert.Equal(t, defaultRequestQueue, s.requestersOf(d.Hash).workerType)
+
+	s.process(progressMessage(d.Hash, pb.ExecutionStage_COMPLETED, time.Now()))
+	assert.NoError(t, waitForResult(t, done))
+}
+
+func TestRecreatedJobGetsNewRequesters(t *testing.T) {
+	s := newTestServer()
+	d := &pb.Digest{Hash: uncachedHash}
+	_, created := s.openStream(d, true, newRequesters("standard", &pb.RequestMetadata{ToolInvocationId: "old"}))
+	require.True(t, created)
+
+	// Once the job is too old to be resumed, the next request starts it afresh.
+	s.jobs[d.Hash].LastUpdate = time.Now().Add(-2 * resumptionTime)
+	_, created = s.openStream(d, true, newRequesters("standard", &pb.RequestMetadata{ToolInvocationId: "new"}))
+	require.True(t, created)
+	assert.Equal(t, []string{"new"}, s.requestersOf(d.Hash).toolInvocationIDs)
+}
+
+func TestJobsStartedElsewhereHaveNoRequesters(t *testing.T) {
+	s := newTestServer()
+	d := &pb.Digest{Hash: uncachedHash}
+	// Another server started this job, we only know about it from its response messages.
+	s.process(progressMessage(d.Hash, pb.ExecutionStage_QUEUED, time.Now()))
+	require.Contains(t, s.jobs, d.Hash)
+	assert.Nil(t, s.requestersOf(d.Hash))
+
+	// A client of ours resuming it doesn't make us the owner; the server that started it will record its usage.
+	_, created := s.openStream(d, true, newRequesters("standard", &pb.RequestMetadata{ToolInvocationId: "inv"}))
+	assert.False(t, created)
+	assert.Nil(t, s.requestersOf(d.Hash))
 }

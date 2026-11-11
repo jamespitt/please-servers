@@ -382,15 +382,18 @@ func (s *server) Execute(req *pb.ExecuteRequest, stream pb.Execution_ExecuteServ
 		return err
 	}
 	// Route on the worker type, falling back to the standard queue for any type we don't have a queue for.
-	topic, ok := s.requests[platform[workerTypeProperty]]
+	queue := platform[workerTypeProperty]
+	topic, ok := s.requests[queue]
 	if !ok {
-		topic = s.requests[defaultRequestQueue]
+		queue = defaultRequestQueue
+		topic = s.requests[queue]
 	}
 	logr.WithFields(logrus.Fields{
 		"hash":       req.ActionDigest.Hash,
 		"workerType": platform[workerTypeProperty],
 	}).Debug("Routing action to request queue")
-	if md := s.contextMetadata(stream.Context()); md != nil {
+	md := s.contextMetadata(stream.Context())
+	if md != nil {
 		logr.WithFields(logrus.Fields{
 			"hash":          req.ActionDigest.Hash,
 			"toolName":      md.ToolDetails.ToolName,
@@ -421,7 +424,7 @@ func (s *server) Execute(req *pb.ExecuteRequest, stream pb.Execution_ExecuteServ
 		}
 	}
 
-	ch, created := s.eventStream(req.ActionDigest, true)
+	ch, created := s.openStream(req.ActionDigest, true, newRequesters(queue, md))
 	if !created {
 		// We didn't create a new execution, so don't need to send a request for a new build.
 		return s.streamEvents(req.ActionDigest, ch, stream)
@@ -516,6 +519,12 @@ func (s *server) streamEvents(digest *pb.Digest, ch <-chan *longrunning.Operatio
 // eventStream registers an event stream for a job.
 // The second return value indicates if we created a new execution or are resuming an existing one.
 func (s *server) eventStream(digest *pb.Digest, create bool) (<-chan *longrunning.Operation, bool) {
+	return s.openStream(digest, create, nil)
+}
+
+// openStream is eventStream for a client whose identity is known.
+// A job we create remembers its requesters, and later clients that resume it are added to them.
+func (s *server) openStream(digest *pb.Digest, create bool, who *requesters) (<-chan *longrunning.Operation, bool) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	j, present := s.jobs[digest.Hash]
@@ -531,6 +540,7 @@ func (s *server) eventStream(digest *pb.Digest, create bool) (<-chan *longrunnin
 			Current:    &longrunning.Operation{Metadata: any},
 			StartTime:  time.Now(),
 			LastUpdate: time.Now(),
+			requesters: who,
 		}
 		s.jobs[digest.Hash] = j
 		logr.WithFields(logrus.Fields{
@@ -545,8 +555,12 @@ func (s *server) eventStream(digest *pb.Digest, create bool) (<-chan *longrunnin
 		j.StartTime = time.Now()
 		j.LastUpdate = time.Now()
 		j.Done = false
+		j.requesters = who
 		created = true
 	} else {
+		if who != nil && j.requesters != nil {
+			j.requesters.add(who.first)
+		}
 		logr.WithFields(logrus.Fields{
 			"hash": digest.Hash,
 		}).Debug("Resuming existing job")
@@ -799,6 +813,9 @@ type job struct {
 	LastUpdate time.Time
 	SentFirst  bool
 	Done       bool
+	// requesters is who asked for the execution. It is only set on the server that received the request;
+	// others learn of the job from the responses to it.
+	requesters *requesters
 }
 
 // unmarshalResponse retrieves the REAPI ExecuteResponse from a longrunning.Operation if it exists.
