@@ -152,6 +152,9 @@ type PubSubOpts struct {
 	PreResponseQueue      string            `long:"pre_response_queue" env:"API_PRE_RESPONSE_QUEUE" required:"true" description:"URL describing the pub/sub queue to connect to for preloading responses to other servers"`
 	NumPollers            int               `long:"num_pollers" env:"API_NUM_POLLERS" default:"10" description:"Number of goroutines receiving messages from the response subscription"`
 	SubscriptionBatchSize uint              `long:"subscription_batch_size" env:"API_SUBSCRIPTION" default:"100" description:"Maximum number of messages to fetch from the response subscription in a single pull"`
+	UsageQueue            string            `long:"usage_queue" env:"API_USAGE_QUEUE" description:"URL defining the pub/sub topic to publish a resource usage record to for each action that is executed, e.g. gcppubsub://my-usage-topic. No records are published if this is empty"`
+	UsageMinMemoryMB      float64           `long:"usage_min_memory_mb" env:"API_USAGE_MIN_MEMORY_MB" description:"Only publish usage records for actions whose peak memory use is at least this many MB. If neither this nor usage_min_execution is set, a record is published for every action"`
+	UsageMinExecution     time.Duration     `long:"usage_min_execution" env:"API_USAGE_MIN_EXECUTION" description:"Only publish usage records for actions that executed for at least this long. If neither this nor usage_min_memory_mb is set, a record is published for every action"`
 }
 
 // ServeForever serves on the given port until terminated.
@@ -247,6 +250,12 @@ func serve(opts grpcutil.Opts, name string, queueOpts PubSubOpts, apiURL string,
 		actuallyValidate: len(allowedPlatform) > 0,
 	}
 
+	if queueOpts.UsageQueue != "" {
+		filter := usageFilter{minMemoryMB: queueOpts.UsageMinMemoryMB, minExecution: queueOpts.UsageMinExecution}
+		srv.usage = newUsageRecorder(filter, topicSender(common.MustOpenTopic(queueOpts.UsageQueue)), usageQueueSize)
+		log.Notice("Publishing action usage records to %s", queueOpts.UsageQueue)
+	}
+
 	// _Technically_ this won't happen more than once in normal running, as we'd only run 1 server, but it does happen in tests.
 	register.Do(func() {
 		prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
@@ -297,6 +306,7 @@ type server struct {
 	numPollers       int
 	deleteJobsTicker *time.Ticker
 	actuallyValidate bool
+	usage            *usageRecorder // Nil if usage records are disabled.
 }
 
 // ServeExecutions serves a list of currently executing jobs over GRPC.
@@ -688,10 +698,12 @@ func (s *server) process(msg *pubsub.Message) {
 		// Only send QUEUED messages if they're the first one. This prevents us from
 		// re-broadcasting a QUEUED message after something's already started executing.
 		j.SentFirst = true
+		completing := false
 		if j.Done && !op.Done {
 			log.Warning("Got a progress message after completion for %s, discarding", key)
 			return
 		} else if op.Done {
+			completing = !j.Done
 			j.Done = true
 			s.completed[key] = published
 		}
@@ -712,7 +724,25 @@ func (s *server) process(msg *pubsub.Message) {
 			}
 			log.Debug("Job %s completed by %s", key, worker)
 		}
+		if completing {
+			s.recordUsage(key, worker, j, op, published)
+		}
 	}
+}
+
+// recordUsage records the resources used by an execution that has just completed.
+// Only the server that was asked for the execution knows who by, so only that one records it.
+// The caller must hold the mutex.
+func (s *server) recordUsage(hash, worker string, j *job, op *longrunning.Operation, completed time.Time) {
+	if s.usage == nil || j.requesters == nil {
+		return
+	}
+	rec, ok := newUsageRecord(hash, worker, j.requesters, unmarshalResponse(op), completed)
+	if !ok {
+		usageRecords.WithLabelValues(usageNoUsage).Inc()
+		return
+	}
+	s.usage.record(rec)
 }
 
 func (s *server) periodicallyDeleteJobs() {

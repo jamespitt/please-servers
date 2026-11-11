@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -1199,4 +1200,137 @@ func TestJobsStartedElsewhereHaveNoRequesters(t *testing.T) {
 	_, created := s.openStream(d, true, newRequesters("standard", &pb.RequestMetadata{ToolInvocationId: "inv"}))
 	assert.False(t, created)
 	assert.Nil(t, s.requestersOf(d.Hash))
+}
+
+// testWorkerKey is the metadata key that identifies the worker in a response message. It matches the one in mettle/common.
+const testWorkerKey = "build.please.mettle.worker"
+
+// completionMessage returns a message from the response queue reporting that a worker completed the given action.
+func completionMessage(t *testing.T, hash, worker string, response *pb.ExecuteResponse, published time.Time) *pubsub.Message {
+	md, err := ptypes.MarshalAny(&pb.ExecuteOperationMetadata{Stage: pb.ExecutionStage_COMPLETED, ActionDigest: &pb.Digest{Hash: hash}})
+	require.NoError(t, err)
+	any, err := ptypes.MarshalAny(response)
+	require.NoError(t, err)
+	b, err := proto.Marshal(&longrunning.Operation{Name: hash, Metadata: md, Done: true, Result: &longrunning.Operation_Response{Response: any}})
+	require.NoError(t, err)
+	return &pubsub.Message{
+		Body: b,
+		Metadata: map[string]string{
+			testPublishTimeKey: published.Format(time.RFC3339Nano),
+			testWorkerKey:      worker,
+		},
+	}
+}
+
+// newUsageServer returns a server that records usage to the returned sink.
+func newUsageServer(t *testing.T) (*server, *sentBodies) {
+	s, _ := newRecordingServer(t, nil)
+	sent := &sentBodies{}
+	s.usage = newUsageRecorder(usageFilter{}, sent.send, usageQueueSize)
+	return s, sent
+}
+
+// requestedByUs makes the server the one that was asked for the given action, as if a client had called Execute.
+func requestedByUs(t *testing.T, s *server, hash string, md *pb.RequestMetadata) {
+	_, created := s.openStream(&pb.Digest{Hash: hash}, true, newRequesters(defaultRequestQueue, md))
+	require.True(t, created)
+}
+
+func TestCompletionPublishesUsageRecord(t *testing.T) {
+	s, sent := newUsageServer(t)
+	d := registerAction(t)
+	// The request metadata comes through the real Execute path, via the stream's context.
+	ctx := requestMetadataContext(t, &pb.RequestMetadata{
+		ToolDetails:             &pb.ToolDetails{ToolName: "please"},
+		ToolInvocationId:        "inv",
+		CorrelatedInvocationsId: "build",
+		TargetId:                "//vault/core:core_test",
+	})
+	finished := make(chan error, 1)
+	go func() {
+		finished <- s.Execute(&pb.ExecuteRequest{ActionDigest: d, SkipCacheLookup: true}, &fakeStream{ctx: ctx})
+	}()
+	require.Eventually(t, func() bool { return s.requestersOf(d.Hash) != nil }, 5*time.Second, 10*time.Millisecond)
+
+	completed := time.Now()
+	s.process(completionMessage(t, d.Hash, "worker-abc", usageResponse(t, completed.Add(-16*time.Second)), completed))
+	assert.NoError(t, waitForResult(t, finished))
+	s.usage.stop()
+
+	require.Len(t, sent.bodies, 1)
+	var rec usageRecord
+	require.NoError(t, json.Unmarshal(sent.bodies[0], &rec))
+	assert.Equal(t, d.Hash, rec.ActionHash)
+	assert.Equal(t, "worker-abc", rec.Worker)
+	assert.Equal(t, defaultRequestQueue, rec.WorkerType)
+	assert.Equal(t, "please", rec.ToolName)
+	assert.Equal(t, "//vault/core:core_test", rec.TargetID)
+	assert.Equal(t, []string{"build"}, rec.CorrelatedInvocationsIDs)
+	assert.Equal(t, completed.UnixMicro(), rec.CompletedAt.UnixMicro())
+	assert.InDelta(t, 2048, rec.MaxRSSMB, 1e-9)
+	assert.InDelta(t, 1.5, rec.CPUCores, 1e-9)
+}
+
+func TestUsageIsOnlyRecordedByTheServerThatWasAsked(t *testing.T) {
+	s, sent := newUsageServer(t)
+	hash := "other-server"
+	// Another server received the request, so we only know of the job from its responses.
+	s.process(progressMessage(hash, pb.ExecutionStage_QUEUED, time.Now()))
+	s.process(completionMessage(t, hash, "worker", usageResponse(t, time.Now()), time.Now()))
+	s.usage.stop()
+	assert.Empty(t, sent.bodies)
+}
+
+func TestUsageIsOnlyRecordedOncePerCompletion(t *testing.T) {
+	s, sent := newUsageServer(t)
+	hash := "redelivered"
+	requestedByUs(t, s, hash, &pb.RequestMetadata{ToolInvocationId: "inv"})
+	completed := time.Now()
+	s.process(completionMessage(t, hash, "worker", usageResponse(t, completed), completed))
+	// Pub/Sub can deliver the completion again; a later publish time means it isn't discarded as stale.
+	s.process(completionMessage(t, hash, "worker", usageResponse(t, completed), completed.Add(time.Second)))
+	s.usage.stop()
+	assert.Len(t, sent.bodies, 1)
+}
+
+func TestNoUsageIsRecordedWithoutResourceUsage(t *testing.T) {
+	s, sent := newUsageServer(t)
+	hash := "no-usage"
+	requestedByUs(t, s, hash, nil)
+	noUsage := outcomeCount(usageNoUsage)
+	// This is a completion with an empty result, as when a worker never ran the action.
+	s.process(progressMessage(hash, pb.ExecutionStage_COMPLETED, time.Now()))
+	s.usage.stop()
+	assert.Empty(t, sent.bodies)
+	assert.Equal(t, noUsage+1, outcomeCount(usageNoUsage))
+}
+
+func TestCompletionWithoutUsageRecorderIsHarmless(t *testing.T) {
+	s := newTestServer()
+	hash := "disabled"
+	_, created := s.openStream(&pb.Digest{Hash: hash}, true, newRequesters(defaultRequestQueue, nil))
+	require.True(t, created)
+	s.process(completionMessage(t, hash, "worker", usageResponse(t, time.Now()), time.Now()))
+	assert.True(t, s.jobs[hash].Done)
+}
+
+func TestUsageOptsFlagParsing(t *testing.T) {
+	var opts PubSubOpts
+	_, err := flags.NewParser(&opts, flags.None).ParseArgs([]string{
+		"--response_queue=mem://responses",
+		"--pre_response_queue=mem://responses",
+		"--usage_queue=gcppubsub://projects/p/topics/usage",
+		"--usage_min_memory_mb=512",
+		"--usage_min_execution=30s",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "gcppubsub://projects/p/topics/usage", opts.UsageQueue)
+	assert.Equal(t, 512.0, opts.UsageMinMemoryMB)
+	assert.Equal(t, 30*time.Second, opts.UsageMinExecution)
+
+	var buf bytes.Buffer
+	flags.NewParser(&opts, flags.None).WriteHelp(&buf)
+	for _, env := range []string{"API_USAGE_QUEUE", "API_USAGE_MIN_MEMORY_MB", "API_USAGE_MIN_EXECUTION"} {
+		assert.Contains(t, buf.String(), "[$"+env+"]")
+	}
 }
