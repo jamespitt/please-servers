@@ -132,6 +132,7 @@ var metrics = []prometheus.Collector{
 	deleteJobsDurations,
 	staleMessages,
 	abandonedJobs,
+	usageRecords,
 }
 
 var register sync.Once

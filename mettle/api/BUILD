@@ -2,6 +2,7 @@ go_library(
     name = "api",
     srcs = [
         "api.go",
+        "recorder.go",
         "usage.go",
     ],
     visibility = ["//mettle/..."],
@@ -35,6 +36,7 @@ go_test(
     name = "api_test",
     srcs = [
         "api_test.go",
+        "recorder_test.go",
         "usage_test.go",
     ],
     deps = [
@@ -42,6 +44,7 @@ go_test(
         "///third_party/go/github.com_bazelbuild_remote-apis//build/bazel/remote/execution/v2",
         "///third_party/go/github.com_golang_protobuf//proto",
         "///third_party/go/github.com_golang_protobuf//ptypes",
+        "///third_party/go/github.com_prometheus_client_golang//prometheus/testutil",
         "///third_party/go/github.com_stretchr_testify//assert",
         "///third_party/go/github.com_stretchr_testify//require",
         "///third_party/go/github.com_thought-machine_go-flags//:go-flags",
